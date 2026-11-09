@@ -1,0 +1,83 @@
+# PR check: build the Box1 builder image without registry, GitOps or cluster API
+# credentials. Each Containerfile RUN step runs the tool it installs, and the
+# warm-up project runs the full Quarkus verify lifecycle, so a successful build is
+# also the smoke test. Runs as ci-builder-check (buildah SCC only). Dependencies
+# come from the in-cluster Reposilite proxy, which admits box1-ci.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: box1-builder-pr-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    pipelinesascode.tekton.dev/target-namespace: box1-ci
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  taskRunTemplate:
+    serviceAccountName: ci-builder-check
+  timeouts:
+    pipeline: 45m
+  pipelineSpec:
+    tasks:
+      - name: build
+        retries: 1   # PAC can briefly create the run before its git auth Secret.
+        taskSpec:
+          volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: containers
+              emptyDir: {}
+          stepTemplate:
+            image: registry.access.redhat.com/ubi9/buildah@sha256:12ab6d225aef49ceed4c7b39e7ab207c4b7f4a67b7dba04a61efbac92c01b8b8
+            workingDir: /workspace/source
+            securityContext:
+              runAsUser: 0
+              capabilities:
+                add: [SETFCAP]
+            computeResources:
+              requests: {cpu: 500m, memory: 2Gi}
+              limits: {cpu: "2", memory: 4Gi}
+            env:
+              - name: HOME
+                value: /workspace/home
+              - name: REVISION
+                value: "{{revision}}"
+              - name: BUILDAH_ISOLATION
+                value: chroot
+              - name: STORAGE_DRIVER
+                value: vfs
+              - name: BUILDAH_FORMAT
+                value: oci
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: containers
+                mountPath: /var/lib/containers
+          steps:
+            - name: fetch
+              workingDir: /workspace
+              env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: "{{git_auth_secret}}"
+                      key: git-provider-token
+              script: |
+                #!/bin/sh
+                set -eu
+                echo "$REVISION" | grep -Eq '^[a-f0-9]{40}$'
+                mkdir -p source home
+                curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/box1-org/box1-build/tarball/$REVISION" \
+                  | tar -xz --strip-components=1 -C source
+                printf 'Fetched box1-build at %s\n' "$REVISION"
+            - name: build
+              script: |
+                #!/bin/sh
+                set -eu
+                buildah build --pull=always --layers=false \
+                  --label "org.opencontainers.image.revision=$REVISION" \
+                  --label "org.opencontainers.image.source=https://github.com/box1-org/box1-build" \
+                  -f builder/Containerfile -t localhost/box1-builder:check builder
+                buildah inspect --format '{{.OCIv1.Config.User}}' localhost/box1-builder:check | grep -qx 185
+                printf 'Built box1-builder for %s\n' "$REVISION"
