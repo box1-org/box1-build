@@ -1,0 +1,105 @@
+# Box1 builder image: the build tools and a baked Maven cache for Box1 CI
+# (box1-org/box1-docs#113).
+#
+# Base: the same UBI 9 OpenJDK 21 image the box1-quarkus-maven Task already uses.
+# Build arguments carry a BOX1_ prefix because the base image sets ENV MAVEN_VERSION=3.9,
+# which would override an ARG of the same name. The base also ships Maven 3.9.9 and
+# Python 3.9 in /usr/bin; the pinned versions below are linked into /usr/local/bin,
+# which comes first on PATH.
+# Added, every version pinned and every download checked against its sha256:
+#   - Apache Maven 3.9.16          /opt/maven          (mvn on PATH)
+#   - syft 1.55.0                  /usr/local/bin/syft (SBOM generation)
+#   - roxctl 4.11.6                /usr/local/bin/roxctl (RHACS scan/check)
+#   - Python 3.11                  /usr/local/bin/python3 (Task scripts)
+#   - Maven settings               /opt/box1/settings.xml (mirror: in-cluster Reposilite)
+#   - Baked Maven repository       /opt/box1/m2 (read-only; use as maven.repo.local.tail)
+#
+# The baked repository holds everything the warm-up project (warmup/) resolves:
+# Quarkus platform ${QUARKUS_PLATFORM_VERSION} BOMs, the union of extensions the
+# Box1 services use, and their build plugins. Builds read it as a chained
+# ("tail") local repository and write anything new to their own
+# maven.repo.local, falling back to Reposilite.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/openjdk-21@sha256:bd995811a45eb587f97a105796f8f43df466a4269411a2a1642f0f9799f885db
+FROM ${BASE_IMAGE}
+
+ARG BOX1_MAVEN_MIRROR=http://reposilite.box1-maven.svc:8080/maven-central
+ARG BOX1_MAVEN_VERSION=3.9.16
+ARG BOX1_MAVEN_SHA256=5af3b743dd8b876b5c45da33b676251e5f1687712644abb4ee519ca56e1d89ce
+ARG BOX1_SYFT_VERSION=1.55.0
+ARG BOX1_SYFT_SHA256=bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d
+ARG BOX1_ROXCTL_VERSION=4.11.6
+ARG BOX1_ROXCTL_SHA256=975fea98a30d2b4e55444366e9202297b4ff0b2a1f5c783994f5af5788b5f983
+
+USER 0
+
+# Python 3.11 for the Task scripts (written for the ubi9/python-311 image they replace).
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 python3.11 tar gzip \
+ && microdnf clean all \
+ && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+ && python3 --version
+
+# Maven, fetched through the same mirror builds use; checksum is platform-owned.
+RUN curl -fsSLo /tmp/maven.zip \
+      "${BOX1_MAVEN_MIRROR}/org/apache/maven/apache-maven/${BOX1_MAVEN_VERSION}/apache-maven-${BOX1_MAVEN_VERSION}-bin.zip" \
+ && echo "${BOX1_MAVEN_SHA256}  /tmp/maven.zip" | sha256sum -c - \
+ && python3 -c 'import zipfile; zipfile.ZipFile("/tmp/maven.zip").extractall("/opt")' \
+ && mv /opt/apache-maven-${BOX1_MAVEN_VERSION} /opt/maven \
+ && chmod 0755 /opt/maven/bin/mvn \
+ && ln -sf /opt/maven/bin/mvn /usr/local/bin/mvn \
+ && rm -f /tmp/maven.zip \
+ && mvn -v
+
+RUN curl -fsSLo /tmp/syft.tar.gz \
+      "https://github.com/anchore/syft/releases/download/v${BOX1_SYFT_VERSION}/syft_${BOX1_SYFT_VERSION}_linux_amd64.tar.gz" \
+ && echo "${BOX1_SYFT_SHA256}  /tmp/syft.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/syft.tar.gz -C /usr/local/bin syft \
+ && chmod 0755 /usr/local/bin/syft \
+ && rm -f /tmp/syft.tar.gz \
+ && syft version
+
+RUN curl -fsSLo /usr/local/bin/roxctl \
+      "https://mirror.openshift.com/pub/rhacs/assets/${BOX1_ROXCTL_VERSION}/bin/Linux/roxctl" \
+ && echo "${BOX1_ROXCTL_SHA256}  /usr/local/bin/roxctl" | sha256sum -c - \
+ && chmod 0755 /usr/local/bin/roxctl \
+ && roxctl version
+
+# Every repository a project declares resolves through the mirror.
+RUN mkdir -p /opt/box1 \
+ && printf '%s\n' \
+      '<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">' \
+      '  <mirrors>' \
+      '    <mirror>' \
+      '      <id>box1-maven</id>' \
+      '      <mirrorOf>*</mirrorOf>' \
+      "      <url>${BOX1_MAVEN_MIRROR}</url>" \
+      '    </mirror>' \
+      '  </mirrors>' \
+      '</settings>' > /opt/box1/settings.xml
+
+# Bake the cache: run the warm-up project in both BOM orders (see warmup/pom.xml).
+COPY warmup /tmp/warmup
+RUN cd /tmp/warmup \
+ && for profile in core camel; do \
+      mvn -B -ntp -s /opt/box1/settings.xml -Dmaven.repo.local=/opt/box1/m2 \
+          -P"$profile" verify dependency:resolve-plugins || exit 1; \
+      rm -rf target; \
+    done \
+ && rm -rf /tmp/warmup /opt/box1/m2/org/box1 \
+ && find /opt/box1/m2 -name '*.lastUpdated' -delete \
+ && chmod -R a+rX,go-w /opt/box1 \
+ && du -sh /opt/box1/m2
+
+# Versions, for people and for the Tasks' log output.
+RUN { echo "maven=${BOX1_MAVEN_VERSION}"; echo "syft=${BOX1_SYFT_VERSION}"; echo "roxctl=${BOX1_ROXCTL_VERSION}"; \
+      echo "python=$(python3 -c 'import platform; print(platform.python_version())')"; \
+      echo "java=$(java -version 2>&1 | head -1)"; \
+      echo "quarkus-platform=$(ls /opt/box1/m2/io/quarkus/platform/quarkus-bom)"; \
+      echo "maven-mirror=${BOX1_MAVEN_MIRROR}"; } > /opt/box1/release \
+ && cat /opt/box1/release
+
+ENV MAVEN_HOME=/opt/maven \
+    BOX1_MAVEN_SETTINGS=/opt/box1/settings.xml \
+    BOX1_MAVEN_TAIL=/opt/box1/m2
+
+# The base image's non-root user; OpenShift runs Task pods with an arbitrary UID anyway.
+USER 185

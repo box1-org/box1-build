@@ -1,0 +1,91 @@
+# Release on push to main: build the Box1 builder image and push it to the
+# box1-build image project as box1-builder:<sha12>. The tag is unique per commit
+# so no release digest is pruned. Tekton Tasks in box1-gitops reference the image
+# by digest; bumping that digest is a reviewed box1-gitops PR (printed below).
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: box1-builder-release-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[main]"
+    pipelinesascode.tekton.dev/target-namespace: box1-ci
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+spec:
+  taskRunTemplate:
+    serviceAccountName: ci-builder-release
+  timeouts:
+    pipeline: 45m
+  pipelineSpec:
+    tasks:
+      - name: build-push
+        retries: 1   # PAC can briefly create the run before its git auth Secret.
+        taskSpec:
+          results:
+            - name: image-digest
+          volumes:
+            - name: workspace
+              emptyDir: {}
+            - name: containers
+              emptyDir: {}
+          stepTemplate:
+            image: registry.access.redhat.com/ubi9/buildah@sha256:12ab6d225aef49ceed4c7b39e7ab207c4b7f4a67b7dba04a61efbac92c01b8b8
+            workingDir: /workspace/source
+            securityContext:
+              runAsUser: 0
+              capabilities:
+                add: [SETFCAP]
+            computeResources:
+              requests: {cpu: 500m, memory: 2Gi}
+              limits: {cpu: "2", memory: 4Gi}
+            env:
+              - name: HOME
+                value: /workspace/home
+              - name: REVISION
+                value: "{{revision}}"
+              - name: BUILDAH_ISOLATION
+                value: chroot
+              - name: STORAGE_DRIVER
+                value: vfs
+              - name: BUILDAH_FORMAT
+                value: oci
+            volumeMounts:
+              - name: workspace
+                mountPath: /workspace
+              - name: containers
+                mountPath: /var/lib/containers
+          steps:
+            - name: fetch
+              workingDir: /workspace
+              env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: "{{git_auth_secret}}"
+                      key: git-provider-token
+              script: |
+                #!/bin/sh
+                set -eu
+                echo "$REVISION" | grep -Eq '^[a-f0-9]{40}$'
+                mkdir -p source home
+                curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  "https://api.github.com/repos/box1-org/box1-build/tarball/$REVISION" \
+                  | tar -xz --strip-components=1 -C source
+                printf 'Fetched box1-build at %s\n' "$REVISION"
+            - name: build-push
+              script: |
+                #!/bin/sh
+                set -eu
+                image="registry.apps.ocp.box1.org/box1-build/box1-builder:$(printf %s "$REVISION" | cut -c1-12)"
+                buildah build --pull=always --layers=false \
+                  --label "org.opencontainers.image.revision=$REVISION" \
+                  --label "org.opencontainers.image.source=https://github.com/box1-org/box1-build" \
+                  -f builder/Containerfile -t "$image" builder
+                buildah inspect --format '{{.OCIv1.Config.User}}' "$image" | grep -qx 185
+                token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                buildah push --creds "serviceaccount:$token" --digestfile /workspace/digest "$image"
+                digest=$(cat /workspace/digest)
+                echo "$digest" | grep -Eq '^sha256:[a-f0-9]{64}$'
+                printf %s "$digest" > "$(results.image-digest.path)"
+                printf 'Published image-registry.openshift-image-registry.svc:5000/box1-build/box1-builder@%s\n' "$digest"
+                printf 'Update the builder image digest in box1-gitops platform/pipelines/tasks to that reference.\n'
